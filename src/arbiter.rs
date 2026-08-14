@@ -164,14 +164,20 @@ impl<'clock, Spi, ChipSelectPin, ReadyPin, WakeupPin, ResetPin, Clock> Arbiter<'
     }
 
     fn wakeup(&mut self) {
-        self.wakeup.set_low();
+        // FORK PATCH: upstream drives WAKEUP low; on the B-L475E-IOT01A the module was
+        // only reliable with WAKEUP held HIGH (kept out of low-power sleep).
+        self.wakeup.set_high();
     }
 
     fn reset(&mut self) {
+        // FORK PATCH: a 10 ms pulse is too short to reliably boot the module; hold
+        // RESET low for a real reset and give it time to come up before the prompt
+        // handshake. (Note: even this does not clear the module's stuck-TCP-stack
+        // state after a warm MCU reboot — that needs a full power cycle. See README.)
         self.reset.set_low();
-        self.delay.delay(Milliseconds(10u32));
+        self.delay.delay(Milliseconds(50u32));
         self.reset.set_high();
-        self.delay.delay(Milliseconds(10u32));
+        self.delay.delay(Milliseconds(500u32));
     }
 
     fn await_data_ready(&mut self) {
@@ -262,10 +268,13 @@ impl<'clock, Spi, ChipSelectPin, ReadyPin, WakeupPin, ResetPin, Clock> Arbiter<'
                     &command!(U8, "C3=4"),
                     &mut response).map_err(|_| JoinError::Unknown)?;
 
+                // FORK PATCH: enable DHCP (C4=1) — upstream omits this, so the
+                // module associates but never gets an IP and every connect fails.
+                self.send_string(
+                    &command!(U8, "C4=1"),
+                    &mut response).map_err(|_| JoinError::Unknown)?;
 
                 let response = self.send_string(&command!(U4, "C0"), &mut response).map_err(|_| JoinError::Unknown)?;
-
-                log::info!( "[[{}]]", core::str::from_utf8(&response).unwrap());
 
                 let parse_result = parser::join_response(&response);
 
@@ -303,6 +312,12 @@ impl<'clock, Spi, ChipSelectPin, ReadyPin, WakeupPin, ResetPin, Clock> Arbiter<'
             &command!( U8, "P0={}", socket_num),
             &mut response).map_err(|e| ConnectError::SpiError(e))?;
 
+        // FORK PATCH: clear any half-open socket first — a stale P6=1 state makes the
+        // next connect report "Failed to connect".
+        self.send_string(
+            &command!(U8, "P6=0"),
+            &mut response).map_err(|e| ConnectError::SpiError(e))?;
+
         match proto {
             IpProtocol::Tcp => {
                 self.send_string(
@@ -316,12 +331,13 @@ impl<'clock, Spi, ChipSelectPin, ReadyPin, WakeupPin, ResetPin, Clock> Arbiter<'
             }
         }
 
+        // FORK PATCH: match the ST BSP ordering — remote PORT (P4) before IP (P3).
         self.send_string(
-            &command!(U32, "P3={}", remote.addr().ip()),
+            &command!(U32, "P4={}", remote.port()),
             &mut response).map_err(|e| ConnectError::SpiError(e))?;
 
         self.send_string(
-            &command!(U32, "P4={}", remote.port()),
+            &command!(U32, "P3={}", remote.addr().ip()),
             &mut response).map_err(|e| ConnectError::SpiError(e))?;
 
         let response = self.send_string(&command!(U8, "P6=1"), &mut response).map_err(|e| ConnectError::SpiError(e))?;

@@ -7,6 +7,8 @@ mod chip_select;
 mod ready;
 mod socket;
 pub mod network;
+#[cfg(feature = "embedded-nal")]
+pub mod nal;
 
 use drogue_embedded_timer::Delay;
 use embedded_hal::blocking::spi::Transfer;

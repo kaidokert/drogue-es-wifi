@@ -6,6 +6,18 @@
 
 Driver for the [Inventek eS-WiFi SPI WiFi offload board](https://www.digikey.com/en/products/detail/inventek-systems/ISM43362-M3G-L44-E-C6-2-1-8/7070042).
 
+> **Local fork.** This copy carries fixes for the ISM43362-M3G-L44 on the
+> B-L475E-IOT01A: DHCP is enabled at join (`C4=1`), the TCP connect sequence
+> matches the ST BSP (clear the socket, then port before IP), `WAKEUP` is held
+> high, and it exposes an [`embedded_nal::TcpClientStack`](src/nal.rs) wrapper
+> (`nal::NalTcpStack`, behind the `embedded-nal` feature) over the native
+> `drogue_network::TcpStack`.
+>
+> **Known hardware limitation:** on the board's `C3.5.2.3.BETA9` module firmware,
+> the TCP client stack stays stuck after a *warm* MCU reboot — ICMP still works
+> but every `connect` returns "Failed to connect". A hardware pin reset does not
+> clear it; a full power cycle of the board does. Cold-boot before running.
+
 ## Usage
 
 The eS-WiFi board is interfaced over an SPI peripheral, plus a handful of additional pins:
