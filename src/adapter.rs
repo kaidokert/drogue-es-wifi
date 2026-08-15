@@ -163,4 +163,9 @@ impl<'clock, Spi, ChipSelectPin, ReadyPin, WakeupPin, ResetPin, Clock> Adapter<'
         )
     }
 
+    /// IPv4 address obtained by DHCP on the last successful join, if any.
+    pub fn ip(&self) -> Option<[u8; 4]> {
+        self.arbiter.borrow().ip()
+    }
+
 }

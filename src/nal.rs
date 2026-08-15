@@ -17,11 +17,19 @@ use embedded_nal::{SocketAddr, TcpClientStack};
 /// Wraps any drogue `TcpStack` (e.g. `Adapter`) as an `embedded_nal` client stack.
 pub struct NalTcpStack<T: TcpStack> {
     inner: T,
+    /// `None` = blocking; `Some(ms)` = open sockets in `Mode::Timeout(ms)`.
+    timeout_ms: Option<u16>,
 }
 
 impl<T: TcpStack> NalTcpStack<T> {
     pub fn new(inner: T) -> Self {
-        Self { inner }
+        Self { inner, timeout_ms: None }
+    }
+    /// Open subsequent sockets with a read timeout (`Mode::Timeout(ms)`) so reads
+    /// return after a bound — needed to poll a TLS/MQTT link without blocking forever.
+    pub fn with_read_timeout(mut self, ms: u16) -> Self {
+        self.timeout_ms = Some(ms);
+        self
     }
     pub fn into_inner(self) -> T {
         self.inner
@@ -57,9 +65,11 @@ where
     type Error = NalError<T::Error>;
 
     fn socket(&mut self) -> Result<Self::TcpSocket, Self::Error> {
-        // Blocking mode: drogue's write/read never yield `WouldBlock`, so the nb
-        // surface here only ever carries real errors.
-        let s = self.inner.open(Mode::Blocking).map_err(NalError::Inner)?;
+        let mode = match self.timeout_ms {
+            Some(ms) => Mode::Timeout(ms),
+            None => Mode::Blocking,
+        };
+        let s = self.inner.open(mode).map_err(NalError::Inner)?;
         Ok(NalSocket(Some(s)))
     }
 

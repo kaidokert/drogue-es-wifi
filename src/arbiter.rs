@@ -62,6 +62,41 @@ pub struct Arbiter<'clock, Spi, ChipSelectPin, ReadyPin, WakeupPin, ResetPin, Cl
     clock: &'clock Clock,
     delay: Delay<'clock, Clock>,
     state: State,
+    /// IPv4 address parsed from the last successful JOIN response (DHCP lease).
+    ip: Option<[u8; 4]>,
+}
+
+/// Parse the dotted-quad IPv4 that follows the SSID in a JOIN response, e.g.
+/// `\r\n[JOIN   ] WK,192.168.0.192,0,0\r\nOK\r\n>` -> [192,168,0,192].
+fn parse_join_ip(resp: &[u8]) -> Option<[u8; 4]> {
+    // The IP is the field between the first and second commas.
+    let start = resp.iter().position(|&b| b == b',')? + 1;
+    let rest = &resp[start..];
+    let end = rest.iter().position(|&b| b == b',')?;
+    let mut octets = [0u8; 4];
+    let mut i = 0;
+    for part in rest[..end].split(|&b| b == b'.') {
+        if i >= 4 {
+            return None;
+        }
+        let mut v: u16 = 0;
+        for &d in part {
+            if !d.is_ascii_digit() {
+                return None;
+            }
+            v = v * 10 + (d - b'0') as u16;
+        }
+        if v > 255 {
+            return None;
+        }
+        octets[i] = v as u8;
+        i += 1;
+    }
+    if i == 4 {
+        Some(octets)
+    } else {
+        None
+    }
 }
 
 impl<'clock, Spi, ChipSelectPin, ReadyPin, WakeupPin, ResetPin, Clock> Arbiter<'clock, Spi, ChipSelectPin, ReadyPin, WakeupPin, ResetPin, Clock>
@@ -89,7 +124,13 @@ impl<'clock, Spi, ChipSelectPin, ReadyPin, WakeupPin, ResetPin, Clock> Arbiter<'
             clock,
             delay: Delay::new(clock),
             state: State::Uninitialized,
+            ip: None,
         }
+    }
+
+    /// IPv4 address from the last successful join (DHCP), if any.
+    pub(crate) fn ip(&self) -> Option<[u8; 4]> {
+        self.ip
     }
 
     fn initialize(&mut self) -> Result<(), ()> {
@@ -301,6 +342,8 @@ impl<'clock, Spi, ChipSelectPin, ReadyPin, WakeupPin, ResetPin, Clock> Arbiter<'
 
                 let response = self.send_string(&command!(U4, "C0"), &mut response).map_err(|_| JoinError::Unknown)?;
 
+                // Capture the DHCP IP (owned) before `response` is borrowed by the parser.
+                let ip = parse_join_ip(response);
                 let parse_result = parser::join_response(&response);
 
                 log::info!("response for JOIN {:?}", parse_result);
@@ -311,6 +354,7 @@ impl<'clock, Spi, ChipSelectPin, ReadyPin, WakeupPin, ResetPin, Clock> Arbiter<'
                     Ok((_, response)) => {
                         match response {
                             JoinResponse::Ok => {
+                                self.ip = ip;
                                 Ok(())
                             }
                             JoinResponse::JoinError => {
