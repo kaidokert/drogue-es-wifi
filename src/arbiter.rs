@@ -239,6 +239,31 @@ impl<'clock, Spi, ChipSelectPin, ReadyPin, WakeupPin, ResetPin, Clock> Arbiter<'
         Ok(&mut response[0..pos])
     }
 
+    /// Binary-safe receive for socket-data reads. Unlike `receive`, it does NOT strip
+    /// `0x15` bytes: for AT-command *text* responses `0x15` is only ever trailing SPI
+    /// padding, but socket payloads (e.g. TLS ciphertext) are random binary and DO
+    /// contain `0x15` — stripping them mid-stream corrupts the data. Trailing padding
+    /// lands after the `\r\nOK\r\n>` prompt, which the read parser excludes anyway.
+    /// Bounds-checked so a full 1460-byte read can't overrun the caller's buffer.
+    fn receive_raw<'a>(&mut self, response: &'a mut [u8]) -> Result<&'a [u8], SpiError> {
+        self.await_data_ready();
+        let mut pos = 0;
+        let _cs = self.cs.select();
+        while self.ready.is_ready() {
+            if pos + 2 > response.len() {
+                break;
+            }
+            let mut xfer: [u8; 2] = [0x0A, 0x0A];
+            if self.spi.transfer(&mut xfer).is_err() {
+                return Err(SpiError::ReadError);
+            }
+            response[pos] = xfer[1];
+            response[pos + 1] = xfer[0];
+            pos += 2;
+        }
+        Ok(&response[0..pos])
+    }
+
     // ------------------------------------------------------------------------
     // Request handling
     // ------------------------------------------------------------------------
@@ -467,7 +492,9 @@ impl<'clock, Spi, ChipSelectPin, ReadyPin, WakeupPin, ResetPin, Clock> Arbiter<'
     fn read_internal(&mut self, socket_num: usize, buffer: &mut [u8]) -> Result<usize, ReadError> {
         self.process_backlog();
 
-        let mut response = [0u8; 1100];
+        // Must hold a full R1-capped read (1460) plus the `\r\n..\r\nOK\r\n> ` framing;
+        // the original 1100 overran for large reads.
+        let mut response = [0u8; 1600];
 
         self.send_string(
             &command!( U8, "P0={}", socket_num),
@@ -509,7 +536,8 @@ impl<'clock, Spi, ChipSelectPin, ReadyPin, WakeupPin, ResetPin, Clock> Arbiter<'
 
         self.await_data_ready();
 
-        let response = self.receive(&mut response).map_err(|e| ReadError::SpiError(e))?;
+        // Binary-safe: socket payloads contain 0x15 bytes that must NOT be stripped.
+        let response = self.receive_raw(&mut response).map_err(|e| ReadError::SpiError(e))?;
 
         if let Ok((_, ReadResponse::Ok(data))) = parser::read_response(&response) {
             for (i, b) in data.iter().enumerate() {
