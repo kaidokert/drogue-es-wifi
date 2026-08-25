@@ -7,8 +7,13 @@ mod chip_select;
 mod ready;
 mod socket;
 pub mod network;
+#[cfg(feature = "net-stats")]
+pub mod net_stats;
 #[cfg(feature = "embedded-nal")]
 pub mod nal;
+
+#[cfg(feature = "net-stats")]
+pub use net_stats::NetStats;
 
 use drogue_embedded_timer::Delay;
 use embedded_hal::blocking::spi::Transfer;

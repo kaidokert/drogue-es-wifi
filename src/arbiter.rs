@@ -26,9 +26,30 @@ macro_rules! command {
     })
 }
 
-enum State {
+/// Upper bound on any single wait for the module to assert DATA_READY. Generous enough
+/// not to trip on a legitimately slow op (an over-the-air DNS lookup or connect), while
+/// still bounding a stuck module to a finite error instead of an unbounded spin.
+const READY_TIMEOUT_MS: u32 = 5_000;
+
+/// RESET-low hold for a mid-run recovery, longer than the 50 ms cold-boot pulse.
+/// Live experiments found a running module ignores a <=120 ms pulse but a ~1 s
+/// assertion reliably drops it, so `recover()` holds RESET low this long before re-booting.
+const RECOVER_RESET_HOLD_MS: u32 = 1_000;
+
+/// Lifecycle state of the module, exposed for supervision. A supervisor
+/// observes it — nothing acts on the state yet.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DriverState {
+    /// Powered but the AT prompt handshake has not completed.
     Uninitialized,
+    /// AT interface up (prompt handshake done), not yet associated.
     Ready,
+    /// Associated to an AP with a DHCP lease.
+    Joined,
+    /// Reserved for a "degraded" classification — defined so a later supervisor has a
+    /// state to observe; the driver itself never enters it.
+    #[allow(dead_code)]
+    Degraded,
 }
 
 
@@ -61,9 +82,13 @@ pub struct Arbiter<'clock, Spi, ChipSelectPin, ReadyPin, WakeupPin, ResetPin, Cl
     reset: ResetPin,
     clock: &'clock Clock,
     delay: Delay<'clock, Clock>,
-    state: State,
+    state: DriverState,
     /// IPv4 address parsed from the last successful JOIN response (DHCP lease).
     ip: Option<[u8; 4]>,
+    /// Count of bounded ready-waits that hit [`READY_TIMEOUT_MS`] — the "module isn't
+    /// answering SPI" signal used by classification. Lives here (not on
+    /// NalTcpStack's NetStats) because the timeout fires here, where the clock is.
+    ready_timeouts: u32,
 }
 
 /// Parse the dotted-quad IPv4 that follows the SSID in a JOIN response, e.g.
@@ -99,6 +124,45 @@ fn parse_join_ip(resp: &[u8]) -> Option<[u8; 4]> {
     }
 }
 
+/// Scan a response for the first bare dotted-quad IPv4 (e.g. the `D0` DNS reply,
+/// which returns just the address, unlike JOIN's comma-delimited fields). Any
+/// hostname echoed in the response has non-digit labels, so it is skipped.
+fn parse_dotted_ip(resp: &[u8]) -> Option<[u8; 4]> {
+    let mut i = 0;
+    while i < resp.len() {
+        if resp[i].is_ascii_digit() {
+            let (mut octets, mut oi, mut v, mut seen) = ([0u8; 4], 0usize, 0u16, false);
+            let mut j = i;
+            while j < resp.len() {
+                match resp[j] {
+                    d @ b'0'..=b'9' => {
+                        v = v * 10 + (d - b'0') as u16;
+                        seen = true;
+                        if v > 255 {
+                            break;
+                        }
+                    }
+                    b'.' if seen && oi < 3 => {
+                        octets[oi] = v as u8;
+                        oi += 1;
+                        v = 0;
+                        seen = false;
+                    }
+                    _ => break,
+                }
+                j += 1;
+            }
+            if oi == 3 && seen {
+                octets[3] = v as u8;
+                return Some(octets);
+            }
+            i = j;
+        }
+        i += 1;
+    }
+    None
+}
+
 impl<'clock, Spi, ChipSelectPin, ReadyPin, WakeupPin, ResetPin, Clock> Arbiter<'clock, Spi, ChipSelectPin, ReadyPin, WakeupPin, ResetPin, Clock>
     where
         Spi: Transfer<u8>,
@@ -123,8 +187,9 @@ impl<'clock, Spi, ChipSelectPin, ReadyPin, WakeupPin, ResetPin, Clock> Arbiter<'
             reset,
             clock,
             delay: Delay::new(clock),
-            state: State::Uninitialized,
+            state: DriverState::Uninitialized,
             ip: None,
+            ready_timeouts: 0,
         }
     }
 
@@ -133,12 +198,57 @@ impl<'clock, Spi, ChipSelectPin, ReadyPin, WakeupPin, ResetPin, Clock> Arbiter<'
         self.ip
     }
 
+    /// Numeric lifecycle state for the health snapshot (0=uninit, 1=ready, 2=joined,
+    /// 3=degraded). Observation only — see [`DriverState`].
+    pub(crate) fn state_code(&self) -> u8 {
+        match self.state {
+            DriverState::Uninitialized => 0,
+            DriverState::Ready => 1,
+            DriverState::Joined => 2,
+            DriverState::Degraded => 3,
+        }
+    }
+
+    /// Bounded ready-wait timeouts so far — the "module not answering" signal.
+    pub(crate) fn ready_timeouts(&self) -> u32 {
+        self.ready_timeouts
+    }
+
+    /// Reflect a supervisor classification into the lifecycle state (observe-only).
+    /// Toggles between Joined and Degraded — never clobbers the Uninitialized/
+    /// Ready bring-up states, and does not itself trigger any recovery.
+    pub(crate) fn set_degraded(&mut self, degraded: bool) {
+        self.state = match (degraded, self.state) {
+            (true, DriverState::Joined) => DriverState::Degraded,
+            (false, DriverState::Degraded) => DriverState::Joined,
+            (_, other) => other,
+        };
+    }
+
     fn initialize(&mut self) -> Result<(), ()> {
         self.wakeup();
         self.reset();
+        self.handshake()
+    }
 
+    /// Mid-run module recovery: drop a wedged module with a long RESET, then re-run
+    /// the AT prompt handshake back to `Ready`. Bounded by `READY_TIMEOUT_MS` (via
+    /// `handshake`/`await_data_ready`), so an unresponsive module returns `Err` instead of
+    /// hanging the owner. Re-association (`join`) is the caller's next step;
+    /// state is left `Uninitialized` if the handshake fails so the snapshot stays honest.
+    pub(crate) fn recover(&mut self) -> Result<(), ()> {
+        self.state = DriverState::Uninitialized;
+        self.wakeup();
+        self.hard_reset();
+        self.handshake()
+    }
+
+    /// Post-reset AT prompt handshake shared by `initialize` (cold boot) and `recover`
+    /// (mid-run). Reads the `\r\n> ` prompt, disables verbosity, and marks the AT
+    /// interface `Ready`.
+    fn handshake(&mut self) -> Result<(), ()> {
         //log::info!("await ready");
-        self.await_data_ready();
+        self.await_data_ready().map_err(|_| ())?;
         //log::info!("ready");
 
         let _cs = self.cs.select();
@@ -178,14 +288,14 @@ impl<'clock, Spi, ChipSelectPin, ReadyPin, WakeupPin, ResetPin, Clock> Arbiter<'
         } else {
             // disable verbosity
             self.send_string(&command!(U8, "MT=1"), &mut response);
-            self.state = State::Ready;
+            self.state = DriverState::Ready;
             log::info!("eS-WiFi adapter is ready");
             Ok(())
         }
     }
 
     fn process_backlog(&mut self) {
-        if matches!(self.state, State::Uninitialized) {
+        if matches!(self.state, DriverState::Uninitialized) {
             self.initialize();
         }
 
@@ -221,10 +331,34 @@ impl<'clock, Spi, ChipSelectPin, ReadyPin, WakeupPin, ResetPin, Clock> Arbiter<'
         self.delay.delay(Milliseconds(500u32));
     }
 
-    fn await_data_ready(&mut self) {
+    fn hard_reset(&mut self) {
+        // A mid-run wedged module ignores the short cold-boot pulse; hold RESET low for
+        // ~1 s to reliably drop it (see RECOVER_RESET_HOLD_MS), then let it re-boot.
+        self.reset.set_low();
+        self.delay.delay(Milliseconds(RECOVER_RESET_HOLD_MS));
+        self.reset.set_high();
+        self.delay.delay(Milliseconds(500u32));
+    }
+
+    /// Wait for the module to assert DATA_READY, bounded by [`READY_TIMEOUT_MS`].
+    ///
+    /// Upstream spun `while !ready {}` with no timeout, so a module that stops asserting
+    /// DATA_READY — after a reset/brownout, or the resolver wedge — hung the owner
+    /// forever, invisibly to an external watchdog.
+    /// Bounding it converts that silent hang into a countable, recoverable error.
+    fn await_data_ready(&mut self) -> Result<(), SpiError> {
+        let timer = self
+            .clock
+            .new_timer(Milliseconds(READY_TIMEOUT_MS))
+            .start()
+            .map_err(|_| SpiError::ReadError)?;
         while !self.ready.is_ready() {
-            continue;
+            if let Ok(true) = timer.is_expired() {
+                self.ready_timeouts = self.ready_timeouts.wrapping_add(1);
+                return Err(SpiError::ReadError);
+            }
         }
+        Ok(())
     }
 
     fn send_string<'a, N: ArrayLength<u8>>(&mut self, command: &String<N>, response: &'a mut [u8]) -> Result<&'a [u8], SpiError> {
@@ -234,7 +368,7 @@ impl<'clock, Spi, ChipSelectPin, ReadyPin, WakeupPin, ResetPin, Clock> Arbiter<'
     fn send<'a>(&mut self, command: &[u8], response: &'a mut [u8]) -> Result<&'a [u8], SpiError> {
         //log::info!("send {:?}", core::str::from_utf8(command).unwrap());
 
-        self.await_data_ready();
+        self.await_data_ready()?;
         {
             let _cs = self.cs.select();
 
@@ -257,12 +391,27 @@ impl<'clock, Spi, ChipSelectPin, ReadyPin, WakeupPin, ResetPin, Clock> Arbiter<'
     }
 
     fn receive<'a>(&mut self, response: &'a mut [u8]) -> Result<&'a [u8], SpiError> {
-        self.await_data_ready();
+        self.await_data_ready()?;
         let mut pos = 0;
 
         let _cs = self.cs.select();
 
+        // Bound the drain: upstream spun `while ready {}` with no timeout AND no `pos`
+        // limit, so a module stuck asserting DATA_READY high (e.g. after a reset) would
+        // both hang here forever and overrun `response`. Cap on time and on buffer space.
+        let timer = self
+            .clock
+            .new_timer(Milliseconds(READY_TIMEOUT_MS))
+            .start()
+            .map_err(|_| SpiError::ReadError)?;
         while self.ready.is_ready() {
+            if pos + 2 > response.len() {
+                break;
+            }
+            if let Ok(true) = timer.is_expired() {
+                self.ready_timeouts = self.ready_timeouts.wrapping_add(1);
+                return Err(SpiError::ReadError);
+            }
             let mut xfer: [u8; 2] = [0x0A, 0x0A];
             let result = self.spi.transfer(&mut xfer);
             if !result.is_ok() {
@@ -287,12 +436,23 @@ impl<'clock, Spi, ChipSelectPin, ReadyPin, WakeupPin, ResetPin, Clock> Arbiter<'
     /// lands after the `\r\nOK\r\n>` prompt, which the read parser excludes anyway.
     /// Bounds-checked so a full 1460-byte read can't overrun the caller's buffer.
     fn receive_raw<'a>(&mut self, response: &'a mut [u8]) -> Result<&'a [u8], SpiError> {
-        self.await_data_ready();
+        self.await_data_ready()?;
         let mut pos = 0;
         let _cs = self.cs.select();
+        // Bounded like `receive` — a module stuck asserting DATA_READY high must not
+        // spin this drain forever (the buffer cap alone bounds memory, not time).
+        let timer = self
+            .clock
+            .new_timer(Milliseconds(READY_TIMEOUT_MS))
+            .start()
+            .map_err(|_| SpiError::ReadError)?;
         while self.ready.is_ready() {
             if pos + 2 > response.len() {
                 break;
+            }
+            if let Ok(true) = timer.is_expired() {
+                self.ready_timeouts = self.ready_timeouts.wrapping_add(1);
+                return Err(SpiError::ReadError);
             }
             let mut xfer: [u8; 2] = [0x0A, 0x0A];
             if self.spi.transfer(&mut xfer).is_err() {
@@ -355,6 +515,7 @@ impl<'clock, Spi, ChipSelectPin, ReadyPin, WakeupPin, ResetPin, Clock> Arbiter<'
                         match response {
                             JoinResponse::Ok => {
                                 self.ip = ip;
+                                self.state = DriverState::Joined;
                                 Ok(())
                             }
                             JoinResponse::JoinError => {
@@ -418,6 +579,16 @@ impl<'clock, Spi, ChipSelectPin, ReadyPin, WakeupPin, ResetPin, Clock> Arbiter<'
         }
     }
 
+    /// DNS lookup via the module's `D0=<hostname>` command. Requires an active
+    /// association (call after `join`). Returns the first resolved IPv4.
+    pub(crate) fn resolve(&mut self, host: &str) -> Option<[u8; 4]> {
+        self.process_backlog();
+        let mut response = [0u8; 128];
+        // "D0=" + hostname (<= HOSTNAME_MAX) + "\r" — needs a roomy String tier.
+        let resp = self.send_string(&command!(U128, "D0={}", host), &mut response).ok()?;
+        parse_dotted_ip(resp)
+    }
+
     pub(crate) fn close(&mut self, socket_num: usize) -> Result<(), CloseError> {
         self.process_backlog();
         let mut response = [0u8; 1024];
@@ -469,7 +640,7 @@ impl<'clock, Spi, ChipSelectPin, ReadyPin, WakeupPin, ResetPin, Clock> Arbiter<'
         let prefix = [b'S', b'0', b'\r', buf[0]];
         let remainder = &buf[1..len];
 
-        self.await_data_ready();
+        self.await_data_ready().map_err(WriteError::SpiError)?;
         {
             let _cs = self.cs.select();
 
@@ -499,7 +670,7 @@ impl<'clock, Spi, ChipSelectPin, ReadyPin, WakeupPin, ResetPin, Clock> Arbiter<'
                 self.spi.transfer(&mut xfer);
             }
         }
-        self.await_data_ready();
+        self.await_data_ready().map_err(WriteError::SpiError)?;
         let response = self.receive(&mut response).map_err(|e| WriteError::SpiError(e))?;
 
         if let Ok((_, WriteResponse::Ok(len))) = parser::write_response(response) {
@@ -567,7 +738,7 @@ impl<'clock, Spi, ChipSelectPin, ReadyPin, WakeupPin, ResetPin, Clock> Arbiter<'
 
         //self.send("R?\r".as_bytes(), &mut response);
 
-        self.await_data_ready();
+        self.await_data_ready().map_err(ReadError::SpiError)?;
         {
             let _cs = self.cs.select();
 
@@ -578,7 +749,7 @@ impl<'clock, Spi, ChipSelectPin, ReadyPin, WakeupPin, ResetPin, Clock> Arbiter<'
             self.spi.transfer(&mut xfer);
         }
 
-        self.await_data_ready();
+        self.await_data_ready().map_err(ReadError::SpiError)?;
 
         // Binary-safe: socket payloads contain 0x15 bytes that must NOT be stripped.
         let response = self.receive_raw(&mut response).map_err(|e| ReadError::SpiError(e))?;

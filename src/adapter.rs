@@ -168,4 +168,77 @@ impl<'clock, Spi, ChipSelectPin, ReadyPin, WakeupPin, ResetPin, Clock> Adapter<'
         self.arbiter.borrow().ip()
     }
 
+    /// Resolve a hostname to an IPv4 via the module's DNS (`D0`). Call after `join`.
+    pub fn resolve(&self, host: &str) -> Option<[u8; 4]> {
+        self.arbiter.borrow_mut().resolve(host)
+    }
+
+}
+
+#[cfg(feature = "embedded-nal")]
+impl<'clock, Spi, ChipSelectPin, ReadyPin, WakeupPin, ResetPin, Clock> crate::nal::ResolveHost
+    for Adapter<'clock, Spi, ChipSelectPin, ReadyPin, WakeupPin, ResetPin, Clock>
+where
+    Spi: Transfer<u8>,
+    ChipSelectPin: OutputPin,
+    ReadyPin: InputPin,
+    WakeupPin: OutputPin,
+    ResetPin: OutputPin,
+    Clock: embedded_time::Clock + 'clock,
+{
+    fn resolve_host(&self, host: &str) -> Option<[u8; 4]> {
+        self.resolve(host)
+    }
+}
+
+#[cfg(feature = "embedded-nal")]
+impl<'clock, Spi, ChipSelectPin, ReadyPin, WakeupPin, ResetPin, Clock> crate::nal::DriverStatus
+    for Adapter<'clock, Spi, ChipSelectPin, ReadyPin, WakeupPin, ResetPin, Clock>
+where
+    Spi: Transfer<u8>,
+    ChipSelectPin: OutputPin,
+    ReadyPin: InputPin,
+    WakeupPin: OutputPin,
+    ResetPin: OutputPin,
+    Clock: embedded_time::Clock + 'clock,
+{
+    fn driver_state(&self) -> u8 {
+        self.arbiter.borrow().state_code()
+    }
+    fn ready_timeouts(&self) -> u32 {
+        self.arbiter.borrow().ready_timeouts()
+    }
+    fn set_degraded(&self, degraded: bool) {
+        self.arbiter.borrow_mut().set_degraded(degraded);
+    }
+}
+
+#[cfg(feature = "embedded-nal")]
+impl<'clock, Spi, ChipSelectPin, ReadyPin, WakeupPin, ResetPin, Clock> crate::nal::Recover
+    for Adapter<'clock, Spi, ChipSelectPin, ReadyPin, WakeupPin, ResetPin, Clock>
+where
+    Spi: Transfer<u8>,
+    ChipSelectPin: OutputPin,
+    ReadyPin: InputPin,
+    WakeupPin: OutputPin,
+    ResetPin: OutputPin,
+    Clock: embedded_time::Clock + 'clock,
+{
+    fn recover(&self, ssid: &str, password: &str) -> bool {
+        let join = JoinInfo::Wep { ssid, password };
+        if join.validate().is_err() {
+            return false;
+        }
+        let mut arbiter = self.arbiter.borrow_mut();
+        // Reset + re-init the AT interface, then re-associate. Both bounded internally.
+        if arbiter.recover().is_err() {
+            return false;
+        }
+        let joined = arbiter.join(&join).is_ok();
+        drop(arbiter);
+        // The module reset dropped every socket; reset our handle table to match so a
+        // stale socket number is never reused against the freshly-booted module.
+        *self.sockets.borrow_mut() = Socket::create();
+        joined
+    }
 }
