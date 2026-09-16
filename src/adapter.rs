@@ -213,6 +213,22 @@ where
     }
 }
 
+#[cfg(all(feature = "embedded-nal", feature = "fault-injection"))]
+impl<'clock, Spi, ChipSelectPin, ReadyPin, WakeupPin, ResetPin, Clock> crate::nal::FaultInject
+    for Adapter<'clock, Spi, ChipSelectPin, ReadyPin, WakeupPin, ResetPin, Clock>
+where
+    Spi: Transfer<u8>,
+    ChipSelectPin: OutputPin,
+    ReadyPin: InputPin,
+    WakeupPin: OutputPin,
+    ResetPin: OutputPin,
+    Clock: embedded_time::Clock + 'clock,
+{
+    fn set_ready_fault(&self, armed: bool) {
+        self.arbiter.borrow_mut().set_ready_fault(armed);
+    }
+}
+
 #[cfg(feature = "embedded-nal")]
 impl<'clock, Spi, ChipSelectPin, ReadyPin, WakeupPin, ResetPin, Clock> crate::nal::Recover
     for Adapter<'clock, Spi, ChipSelectPin, ReadyPin, WakeupPin, ResetPin, Clock>

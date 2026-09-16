@@ -40,6 +40,18 @@ pub trait Recover {
     fn recover(&self, ssid: &str, password: &str) -> bool;
 }
 
+/// Fault injection against the module's SPI-level signalling (dev only). Kept separate
+/// from [`DriverStatus`] so the capability is opt-in per stack, like [`Recover`].
+#[cfg(feature = "fault-injection")]
+pub trait FaultInject {
+    /// Arm/disarm a ready-wait fault: every bounded wait for DATA_READY reports a
+    /// timeout without touching the module, which a supervisor watching the
+    /// ready-timeout counter classifies as "module unresponsive". Stays armed until
+    /// disarmed, so recovery — which re-runs the handshake through the same wait —
+    /// keeps failing and a bounded recovery loop reaches its terminal state.
+    fn set_ready_fault(&self, armed: bool);
+}
+
 /// Wraps any drogue `TcpStack` (e.g. `Adapter`) as an `embedded_nal` client stack.
 pub struct NalTcpStack<T: TcpStack> {
     inner: T,
@@ -96,6 +108,17 @@ impl<T: TcpStack> NalTcpStack<T> {
     #[cfg(feature = "fault-injection")]
     pub fn set_resolve_ok(&mut self, ip: Option<[u8; 4]>) {
         self.resolve_ok = ip;
+    }
+    /// Arm/disarm the ready-wait fault on the underlying stack: bounded DATA_READY waits
+    /// report timeouts without the module being touched. Unlike the resolve and connect
+    /// faults, this one also fails `recover`, since recovery's handshake runs through the
+    /// same wait — which is the point, as it lets a bounded recovery loop cap out.
+    #[cfg(feature = "fault-injection")]
+    pub fn set_ready_fault(&self, armed: bool)
+    where
+        T: FaultInject,
+    {
+        self.inner.set_ready_fault(armed)
     }
     /// Snapshot the driver's network counters (feature `net-stats`).
     #[cfg(feature = "net-stats")]
