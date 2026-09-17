@@ -94,6 +94,12 @@ pub struct Arbiter<'clock, Spi, ChipSelectPin, ReadyPin, WakeupPin, ResetPin, Cl
     /// exercised without wedging the module. Stays armed until cleared: `recover()` runs
     /// its handshake through the same wait, so recovery keeps failing while it is set —
     /// which is what lets a bounded self-recovery loop escalate to its terminal state.
+    ///
+    /// Ordinary traffic leaves the module alone, but recovery does not: `recover()` drives
+    /// RESET before its handshake reaches this fault, so every attempt really does reboot
+    /// and de-associate the module — the same thing a real unresponsive module would get.
+    /// Clearing the fault therefore restores the SPI interface but not the association;
+    /// that needs a recovery attempt made while the fault is down.
     #[cfg(feature = "fault-injection")]
     ready_fault: bool,
 }
@@ -223,8 +229,9 @@ impl<'clock, Spi, ChipSelectPin, ReadyPin, WakeupPin, ResetPin, Clock> Arbiter<'
         self.ready_timeouts
     }
 
-    /// Arm/disarm the ready-wait fault (dev only). Leaves the module untouched, so
-    /// disarming restores normal operation with no reset.
+    /// Arm/disarm the ready-wait fault (dev only). Normal operation never touches the
+    /// module, so disarming restores it; a recovery attempt made while it is armed still
+    /// resets the module for real, since RESET precedes the handshake that fails.
     #[cfg(feature = "fault-injection")]
     pub(crate) fn set_ready_fault(&mut self, armed: bool) {
         self.ready_fault = armed;

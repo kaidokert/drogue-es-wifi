@@ -247,13 +247,12 @@ where
         }
         let mut arbiter = self.arbiter.borrow_mut();
         // Reset + re-init the AT interface, then re-associate. Both bounded internally.
-        if arbiter.recover().is_err() {
-            return false;
-        }
-        let joined = arbiter.join(&join).is_ok();
+        let joined = arbiter.recover().is_ok() && arbiter.join(&join).is_ok();
         drop(arbiter);
-        // The module reset dropped every socket; reset our handle table to match so a
-        // stale socket number is never reused against the freshly-booted module.
+        // `recover` drives RESET before anything that can fail, so the module has dropped
+        // every socket whether or not the re-init succeeded. Reset the handle table to
+        // match on both paths, or a failed recovery leaves stale socket numbers pointing
+        // at a module that no longer knows them.
         *self.sockets.borrow_mut() = Socket::create();
         joined
     }

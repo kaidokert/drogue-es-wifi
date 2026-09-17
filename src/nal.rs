@@ -49,6 +49,11 @@ pub trait FaultInject {
     /// ready-timeout counter classifies as "module unresponsive". Stays armed until
     /// disarmed, so recovery — which re-runs the handshake through the same wait —
     /// keeps failing and a bounded recovery loop reaches its terminal state.
+    ///
+    /// Recovery is the one path that does reach the hardware: it drives RESET before the
+    /// handshake fails, so each attempt reboots and de-associates the module exactly as a
+    /// real unresponsive module would. Disarming restores the SPI interface, not the
+    /// association — re-joining takes a recovery attempt made with the fault down.
     fn set_ready_fault(&self, armed: bool);
 }
 
@@ -112,7 +117,9 @@ impl<T: TcpStack> NalTcpStack<T> {
     /// Arm/disarm the ready-wait fault on the underlying stack: bounded DATA_READY waits
     /// report timeouts without the module being touched. Unlike the resolve and connect
     /// faults, this one also fails `recover`, since recovery's handshake runs through the
-    /// same wait — which is the point, as it lets a bounded recovery loop cap out.
+    /// same wait — which is the point, as it lets a bounded recovery loop cap out. Note
+    /// that those attempts still reset the module, so the association does not survive
+    /// them; see [`FaultInject::set_ready_fault`].
     #[cfg(feature = "fault-injection")]
     pub fn set_ready_fault(&self, armed: bool)
     where
