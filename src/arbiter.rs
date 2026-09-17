@@ -89,6 +89,19 @@ pub struct Arbiter<'clock, Spi, ChipSelectPin, ReadyPin, WakeupPin, ResetPin, Cl
     /// answering SPI" signal used by classification. Lives here (not on
     /// NalTcpStack's NetStats) because the timeout fires here, where the clock is.
     ready_timeouts: u32,
+    /// Fault injection: when set, every bounded ready-wait reports a timeout without
+    /// consulting DATA_READY, so a supervisor's "module isn't answering SPI" path can be
+    /// exercised without wedging the module. Stays armed until cleared: `recover()` runs
+    /// its handshake through the same wait, so recovery keeps failing while it is set —
+    /// which is what lets a bounded self-recovery loop escalate to its terminal state.
+    ///
+    /// Ordinary traffic leaves the module alone, but recovery does not: `recover()` drives
+    /// RESET before its handshake reaches this fault, so every attempt really does reboot
+    /// and de-associate the module — the same thing a real unresponsive module would get.
+    /// Clearing the fault therefore restores the SPI interface but not the association;
+    /// that needs a recovery attempt made while the fault is down.
+    #[cfg(feature = "fault-injection")]
+    ready_fault: bool,
 }
 
 /// Parse the dotted-quad IPv4 that follows the SSID in a JOIN response, e.g.
@@ -190,6 +203,8 @@ impl<'clock, Spi, ChipSelectPin, ReadyPin, WakeupPin, ResetPin, Clock> Arbiter<'
             state: DriverState::Uninitialized,
             ip: None,
             ready_timeouts: 0,
+            #[cfg(feature = "fault-injection")]
+            ready_fault: false,
         }
     }
 
@@ -212,6 +227,14 @@ impl<'clock, Spi, ChipSelectPin, ReadyPin, WakeupPin, ResetPin, Clock> Arbiter<'
     /// Bounded ready-wait timeouts so far — the "module not answering" signal.
     pub(crate) fn ready_timeouts(&self) -> u32 {
         self.ready_timeouts
+    }
+
+    /// Arm/disarm the ready-wait fault (dev only). Normal operation never touches the
+    /// module, so disarming restores it; a recovery attempt made while it is armed still
+    /// resets the module for real, since RESET precedes the handshake that fails.
+    #[cfg(feature = "fault-injection")]
+    pub(crate) fn set_ready_fault(&mut self, armed: bool) {
+        self.ready_fault = armed;
     }
 
     /// Reflect a supervisor classification into the lifecycle state (observe-only).
@@ -347,6 +370,13 @@ impl<'clock, Spi, ChipSelectPin, ReadyPin, WakeupPin, ResetPin, Clock> Arbiter<'
     /// forever, invisibly to an external watchdog.
     /// Bounding it converts that silent hang into a countable, recoverable error.
     fn await_data_ready(&mut self) -> Result<(), SpiError> {
+        // Injected fault: report the same countable timeout the real path does, but
+        // without the wait, so a test does not pay READY_TIMEOUT_MS per operation.
+        #[cfg(feature = "fault-injection")]
+        if self.ready_fault {
+            self.ready_timeouts = self.ready_timeouts.wrapping_add(1);
+            return Err(SpiError::ReadError);
+        }
         let timer = self
             .clock
             .new_timer(Milliseconds(READY_TIMEOUT_MS))
