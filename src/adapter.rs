@@ -278,7 +278,7 @@ where
 }
 
 #[cfg(feature = "embedded-nal")]
-impl<'clock, Spi, ChipSelectPin, ReadyPin, WakeupPin, ResetPin, Clock> crate::nal::Leave
+impl<'clock, Spi, ChipSelectPin, ReadyPin, WakeupPin, ResetPin, Clock> crate::nal::Rejoin
     for Adapter<'clock, Spi, ChipSelectPin, ReadyPin, WakeupPin, ResetPin, Clock>
 where
     Spi: Transfer<u8>,
@@ -293,5 +293,22 @@ where
         // method share a name, and spelling out which one is called keeps a future reader
         // from having to know that inherent resolution wins.
         Adapter::leave(self).is_ok()
+    }
+
+    fn rejoin(&self, ssid: &str, password: &str) -> bool {
+        let join = JoinInfo::Wep { ssid, password };
+        if join.validate().is_err() {
+            return false;
+        }
+        let mut arbiter = self.arbiter.borrow_mut();
+        // Disassociate, then take the network again. No RESET and no AT handshake, which
+        // is the whole point: this rung costs one command pair, not a module reboot.
+        let rejoined = arbiter.leave().is_ok() && arbiter.join(&join).is_ok();
+        drop(arbiter);
+        // The association is gone once `CD` has been sent, whether or not the re-join
+        // succeeded, so the handle table must not keep claiming sockets the module has
+        // forgotten — the same reason `recover` resets it.
+        *self.sockets.borrow_mut() = Socket::create();
+        rejoined
     }
 }
