@@ -9,9 +9,9 @@ use core::fmt::Write;
 use crate::chip_select::ChipSelect;
 use crate::ready::Ready;
 use nom::InputIter;
-use crate::adapter::{AdapterError, JoinError, JoinInfo, ConnectError, WriteError, ReadError, CloseError};
+use crate::adapter::{AdapterError, JoinError, JoinInfo, ConnectError, WriteError, ReadError, CloseError, LeaveError};
 use crate::parser;
-use crate::parser::{JoinResponse, ConnectResponse, WriteResponse, ReadResponse, CloseResponse};
+use crate::parser::{JoinResponse, ConnectResponse, WriteResponse, ReadResponse, CloseResponse, LeaveResponse};
 use nom::error::ErrorKind;
 use drogue_network::addr::HostSocketAddr;
 
@@ -617,6 +617,31 @@ impl<'clock, Spi, ChipSelectPin, ReadyPin, WakeupPin, ResetPin, Clock> Arbiter<'
         // "D0=" + hostname (<= HOSTNAME_MAX) + "\r" — needs a roomy String tier.
         let resp = self.send_string(&command!(U128, "D0={}", host), &mut response).ok()?;
         parse_dotted_ip(resp)
+    }
+
+    /// Leave the current access point without touching RESET. `CD` disassociates while
+    /// the AT interface stays up, so the module drops back to `Ready` and a following
+    /// `join` takes a fresh DHCP lease and a fresh DNS server. This is the cheap rung
+    /// beneath `recover()`, which reboots the module and costs a full handshake.
+    pub(crate) fn leave(&mut self) -> Result<(), LeaveError> {
+        self.process_backlog();
+        let mut response = [0u8; 1024];
+
+        let response = self
+            .send_string(&command!(U4, "CD"), &mut response)
+            .map_err(|e| LeaveError::SpiError(e))?;
+
+        match parser::leave_response(&response) {
+            Ok((_, LeaveResponse::Ok)) => {
+                // The DHCP lease went with the association. Keeping the cached address
+                // would report an IP the module no longer holds, which is exactly the
+                // stale-state trap that makes association loss hard to tell apart.
+                self.ip = None;
+                self.state = DriverState::Ready;
+                Ok(())
+            }
+            _ => Err(LeaveError::Error),
+        }
     }
 
     pub(crate) fn close(&mut self, socket_num: usize) -> Result<(), CloseError> {

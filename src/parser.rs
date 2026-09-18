@@ -167,6 +167,46 @@ named!(
 );
 
 #[derive(Debug)]
+pub(crate) enum LeaveResponse {
+    Ok,
+    Error,
+}
+
+named!(
+    pub(crate) left<LeaveResponse>,
+    do_parse!(
+        tag!("\r\n") >>
+        tag!("\r\n") >>
+        ok >>
+        prompt >>
+        (
+            LeaveResponse::Ok
+        )
+    )
+);
+
+named!(
+    pub(crate) leave_error<LeaveResponse>,
+    do_parse!(
+        tag!("\r\n") >>
+        take_until!( "ERROR" ) >>
+        error >>
+        prompt >>
+        (
+            LeaveResponse::Error
+        )
+    )
+);
+
+named!(
+    pub(crate) leave_response<LeaveResponse>,
+    alt!(
+          complete!(left)
+        | complete!(leave_error)
+    )
+);
+
+#[derive(Debug)]
 pub(crate) enum WriteResponse {
     Ok(usize),
     Error,

@@ -40,6 +40,16 @@ pub trait Recover {
     fn recover(&self, ssid: &str, password: &str) -> bool;
 }
 
+/// Soft re-association: leave the current access point without resetting the module, so a
+/// following join takes a fresh DHCP lease and a fresh DNS server. Kept separate from
+/// [`Recover`] so a supervisor can reach for the cheap rung without also taking on the
+/// one that reboots the module.
+pub trait Leave {
+    /// Returns `true` if the module accepted the disassociation and the AT interface is
+    /// still up. Re-joining is the caller's next step, exactly as with [`Recover`].
+    fn leave(&self) -> bool;
+}
+
 /// Fault injection against the module's SPI-level signalling (dev only). Kept separate
 /// from [`DriverStatus`] so the capability is opt-in per stack, like [`Recover`].
 #[cfg(feature = "fault-injection")]
