@@ -51,6 +51,12 @@ pub enum CloseError {
 }
 
 #[derive(Debug)]
+pub enum LeaveError {
+    SpiError(SpiError),
+    Error,
+}
+
+#[derive(Debug)]
 pub enum WriteError {
     Error,
     SpiError(SpiError)
@@ -163,6 +169,19 @@ impl<'clock, Spi, ChipSelectPin, ReadyPin, WakeupPin, ResetPin, Clock> Adapter<'
         )
     }
 
+    /// Leave the current access point WITHOUT resetting the module: the AT interface
+    /// stays up, so a following `join` re-associates with a fresh DHCP lease and DNS
+    /// server. Cheaper than `recover()`, which reboots the module.
+    pub fn leave(&self) -> Result<(), LeaveError> {
+        let result = self.arbiter.borrow_mut().leave();
+        // Disassociating drops every connection the module was holding, so the handle
+        // table must not keep claiming sockets it no longer knows -- the same reason
+        // `recover` resets it, and on both the success and failure paths for the same
+        // reason: the association is gone either way once `CD` has been sent.
+        *self.sockets.borrow_mut() = Socket::create();
+        result
+    }
+
     /// IPv4 address obtained by DHCP on the last successful join, if any.
     pub fn ip(&self) -> Option<[u8; 4]> {
         self.arbiter.borrow().ip()
@@ -255,5 +274,41 @@ where
         // at a module that no longer knows them.
         *self.sockets.borrow_mut() = Socket::create();
         joined
+    }
+}
+
+#[cfg(feature = "embedded-nal")]
+impl<'clock, Spi, ChipSelectPin, ReadyPin, WakeupPin, ResetPin, Clock> crate::nal::Rejoin
+    for Adapter<'clock, Spi, ChipSelectPin, ReadyPin, WakeupPin, ResetPin, Clock>
+where
+    Spi: Transfer<u8>,
+    ChipSelectPin: OutputPin,
+    ReadyPin: InputPin,
+    WakeupPin: OutputPin,
+    ResetPin: OutputPin,
+    Clock: embedded_time::Clock + 'clock,
+{
+    fn leave(&self) -> bool {
+        // Named explicitly rather than `self.leave()`: the inherent method and this trait
+        // method share a name, and spelling out which one is called keeps a future reader
+        // from having to know that inherent resolution wins.
+        Adapter::leave(self).is_ok()
+    }
+
+    fn rejoin(&self, ssid: &str, password: &str) -> bool {
+        let join = JoinInfo::Wep { ssid, password };
+        if join.validate().is_err() {
+            return false;
+        }
+        let mut arbiter = self.arbiter.borrow_mut();
+        // Disassociate, then take the network again. No RESET and no AT handshake, which
+        // is the whole point: this rung costs one command pair, not a module reboot.
+        let rejoined = arbiter.leave().is_ok() && arbiter.join(&join).is_ok();
+        drop(arbiter);
+        // The association is gone once `CD` has been sent, whether or not the re-join
+        // succeeded, so the handle table must not keep claiming sockets the module has
+        // forgotten — the same reason `recover` resets it.
+        *self.sockets.borrow_mut() = Socket::create();
+        rejoined
     }
 }

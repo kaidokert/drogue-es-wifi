@@ -40,6 +40,24 @@ pub trait Recover {
     fn recover(&self, ssid: &str, password: &str) -> bool;
 }
 
+/// Soft re-association: drop the current access point and take it again without resetting
+/// the module, so the link comes back with a fresh DHCP lease and a fresh DNS server. Kept
+/// separate from [`Recover`] so a supervisor can reach for the cheap rung without also
+/// taking on the one that reboots the module.
+pub trait Rejoin {
+    /// Leave the access point. Returns `true` if the module accepted the disassociation
+    /// and the AT interface is still up. The association is gone either way.
+    fn leave(&self) -> bool;
+
+    /// Leave and re-associate in one call. Returns `true` if the module came back
+    /// associated.
+    ///
+    /// Bundled for the same reason [`Recover`] bundles reset and join: a caller holding
+    /// the stack through a wrapper has no way to issue the join half on its own, so a
+    /// bare `leave` would strand the link disassociated.
+    fn rejoin(&self, ssid: &str, password: &str) -> bool;
+}
+
 /// Fault injection against the module's SPI-level signalling (dev only). Kept separate
 /// from [`DriverStatus`] so the capability is opt-in per stack, like [`Recover`].
 #[cfg(feature = "fault-injection")]
@@ -161,6 +179,25 @@ impl<T: TcpStack> NalTcpStack<T> {
         T: Recover,
     {
         self.inner.recover(ssid, password)
+    }
+    /// Leave the access point without resetting the module. The AT interface stays up;
+    /// re-associating is the caller's next step, so prefer [`Self::rejoin`] unless the
+    /// link is meant to stay down.
+    pub fn leave(&self) -> bool
+    where
+        T: Rejoin,
+    {
+        self.inner.leave()
+    }
+    /// Soft re-join: disassociate and re-associate without resetting the module, for a
+    /// fresh DHCP lease and DNS server. Returns `true` if it came back associated.
+    /// The association drops, so the caller must discard any socket handles it still
+    /// holds — the same contract as [`Self::recover`], at a fraction of the cost.
+    pub fn rejoin(&self, ssid: &str, password: &str) -> bool
+    where
+        T: Rejoin,
+    {
+        self.inner.rejoin(ssid, password)
     }
     /// Open subsequent sockets with a read timeout (`Mode::Timeout(ms)`) so reads
     /// return after a bound — needed to poll a TLS/MQTT link without blocking forever.
