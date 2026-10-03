@@ -12,13 +12,39 @@ use core::fmt::Debug;
 
 use drogue_network::addr::{HostAddr, HostSocketAddr};
 use drogue_network::tcp::{Mode, TcpStack};
-use embedded_nal::{AddrType, Dns, IpAddr, Ipv4Addr, SocketAddr, TcpClientStack};
+use embedded_nal::{
+    AddrType, Dns, IpAddr, Ipv4Addr, SocketAddr, TcpClientStack, UdpClientStack, UdpFullStack,
+};
 
 /// Hostname → IPv4 resolution, provided by the underlying offload stack (the
 /// ISM43362 `D0` command). Kept separate from `TcpStack` so [`NalTcpStack`]'s
 /// [`Dns`] impl stays generic over any stack that can resolve.
 pub trait ResolveHost {
     fn resolve_host(&self, host: &str) -> Option<[u8; 4]>;
+}
+
+/// UDP datagrams, provided by the underlying offload stack. Kept separate from
+/// `TcpStack` so [`NalTcpStack`]'s UDP impls stay generic over any stack that has them.
+pub trait UdpDatagrams {
+    type UdpSocket;
+    type UdpError: Debug;
+    /// Open a UDP endpoint whose datagrams leave from `local_port`.
+    fn udp_open(&self, local_port: u16) -> Result<Self::UdpSocket, Self::UdpError>;
+    /// Send one datagram to `remote`.
+    fn udp_send_to(
+        &self,
+        socket: &mut Self::UdpSocket,
+        remote: [u8; 4],
+        port: u16,
+        buffer: &[u8],
+    ) -> Result<(), Self::UdpError>;
+    /// Receive one datagram and its sender, or `WouldBlock` when none is waiting.
+    fn udp_recv_from(
+        &self,
+        socket: &mut Self::UdpSocket,
+        buffer: &mut [u8],
+    ) -> nb::Result<(usize, [u8; 4], u16), Self::UdpError>;
+    fn udp_close(&self, socket: Self::UdpSocket) -> Result<(), Self::UdpError>;
 }
 
 /// Lifecycle state of the underlying offload stack, for supervision snapshots.
@@ -78,6 +104,8 @@ pub trait FaultInject {
 /// Wraps any drogue `TcpStack` (e.g. `Adapter`) as an `embedded_nal` client stack.
 pub struct NalTcpStack<T: TcpStack> {
     inner: T,
+    /// Next local port handed to a UDP socket that is never bound.
+    next_ephemeral: u16,
     /// `None` = blocking; `Some(ms)` = open sockets in `Mode::Timeout(ms)`.
     timeout_ms: Option<u16>,
     /// Driver-level counters, held here (not a global) so an isolated owner can
@@ -105,6 +133,7 @@ impl<T: TcpStack> NalTcpStack<T> {
     pub fn new(inner: T) -> Self {
         Self {
             inner,
+            next_ephemeral: EPHEMERAL_FIRST,
             timeout_ms: None,
             #[cfg(feature = "net-stats")]
             stats: crate::net_stats::NetStats::default(),
@@ -224,6 +253,8 @@ pub enum NalError<E> {
     UnsupportedAddr,
     /// DNS lookup returned no address (NXDOMAIN, no association, or module error).
     ResolveFailed,
+    /// `bind` on a UDP socket that is already open.
+    AlreadyOpen,
 }
 
 fn map_nb<E>(e: nb::Error<E>) -> nb::Error<NalError<E>> {
@@ -330,6 +361,125 @@ where
             }
             None => Ok(()),
         }
+    }
+}
+
+/// The IANA dynamic port range a never-bound UDP socket takes its local port from.
+const EPHEMERAL_FIRST: u16 = 49152;
+
+/// An `embedded_nal` UDP socket. The module socket opens when the local port is
+/// known: at `bind`, or at the first `connect` or `send_to` of an unbound socket.
+pub struct NalUdpSocket<S> {
+    inner: Option<S>,
+    remote: Option<([u8; 4], u16)>,
+}
+
+fn ipv4<E>(remote: SocketAddr) -> Result<([u8; 4], u16), NalError<E>> {
+    match remote {
+        SocketAddr::V4(a) => Ok((a.ip().octets(), a.port())),
+        SocketAddr::V6(_) => Err(NalError::UnsupportedAddr),
+    }
+}
+
+impl<T: TcpStack + UdpDatagrams> NalTcpStack<T>
+where
+    T::Error: Debug,
+{
+    fn ephemeral_port(&mut self) -> u16 {
+        let port = self.next_ephemeral;
+        self.next_ephemeral = port.checked_add(1).unwrap_or(EPHEMERAL_FIRST);
+        port
+    }
+
+    fn open_udp(
+        &mut self,
+        socket: &mut NalUdpSocket<T::UdpSocket>,
+        local_port: u16,
+    ) -> Result<(), NalError<T::UdpError>> {
+        if socket.inner.is_some() {
+            return Ok(());
+        }
+        socket.inner = Some(self.inner.udp_open(local_port).map_err(NalError::Inner)?);
+        Ok(())
+    }
+}
+
+impl<T: TcpStack + UdpDatagrams> UdpClientStack for NalTcpStack<T>
+where
+    T::Error: Debug,
+{
+    type UdpSocket = NalUdpSocket<T::UdpSocket>;
+    type Error = NalError<T::UdpError>;
+
+    fn socket(&mut self) -> Result<Self::UdpSocket, Self::Error> {
+        Ok(NalUdpSocket {
+            inner: None,
+            remote: None,
+        })
+    }
+
+    fn connect(&mut self, socket: &mut Self::UdpSocket, remote: SocketAddr) -> Result<(), Self::Error> {
+        let remote = ipv4(remote)?;
+        let port = self.ephemeral_port();
+        self.open_udp(socket, port)?;
+        socket.remote = Some(remote);
+        Ok(())
+    }
+
+    fn send(&mut self, socket: &mut Self::UdpSocket, buffer: &[u8]) -> nb::Result<(), Self::Error> {
+        let (ip, port) = socket.remote.ok_or(nb::Error::Other(NalError::NotConnected))?;
+        let inner = socket.inner.as_mut().ok_or(nb::Error::Other(NalError::NotConnected))?;
+        self.inner
+            .udp_send_to(inner, ip, port, buffer)
+            .map_err(|e| nb::Error::Other(NalError::Inner(e)))
+    }
+
+    fn receive(
+        &mut self,
+        socket: &mut Self::UdpSocket,
+        buffer: &mut [u8],
+    ) -> nb::Result<(usize, SocketAddr), Self::Error> {
+        let inner = socket.inner.as_mut().ok_or(nb::Error::Other(NalError::NotConnected))?;
+        let (len, ip, port) = self.inner.udp_recv_from(inner, buffer).map_err(|e| match e {
+            nb::Error::WouldBlock => nb::Error::WouldBlock,
+            nb::Error::Other(e) => nb::Error::Other(NalError::Inner(e)),
+        })?;
+        let source = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(ip[0], ip[1], ip[2], ip[3])), port);
+        Ok((len, source))
+    }
+
+    fn close(&mut self, socket: Self::UdpSocket) -> Result<(), Self::Error> {
+        match socket.inner {
+            Some(inner) => self.inner.udp_close(inner).map_err(NalError::Inner),
+            None => Ok(()),
+        }
+    }
+}
+
+impl<T: TcpStack + UdpDatagrams> UdpFullStack for NalTcpStack<T>
+where
+    T::Error: Debug,
+{
+    fn bind(&mut self, socket: &mut Self::UdpSocket, local_port: u16) -> Result<(), Self::Error> {
+        if socket.inner.is_some() {
+            return Err(NalError::AlreadyOpen);
+        }
+        self.open_udp(socket, local_port)
+    }
+
+    fn send_to(
+        &mut self,
+        socket: &mut Self::UdpSocket,
+        remote: SocketAddr,
+        buffer: &[u8],
+    ) -> nb::Result<(), Self::Error> {
+        let (ip, port) = ipv4(remote).map_err(nb::Error::Other)?;
+        let local = self.ephemeral_port();
+        self.open_udp(socket, local).map_err(nb::Error::Other)?;
+        let inner = socket.inner.as_mut().ok_or(nb::Error::Other(NalError::NotConnected))?;
+        self.inner
+            .udp_send_to(inner, ip, port, buffer)
+            .map_err(|e| nb::Error::Other(NalError::Inner(e)))
     }
 }
 
