@@ -490,7 +490,11 @@ where
         let inner = socket.inner.as_mut().ok_or(nb::Error::Other(NalError::NotConnected))?;
         self.inner
             .udp_send_to(inner, ip, port, buffer)
-            .map_err(|e| nb::Error::Other(NalError::Inner(e)))
+            .map_err(|e| nb::Error::Other(NalError::Inner(e)))?;
+        // embedded-nal's `send` goes to the connected peer or, failing a later
+        // `connect`, to the destination the last `send_to` used.
+        socket.remote = Some((ip, port));
+        Ok(())
     }
 }
 
@@ -555,5 +559,105 @@ where
         _addr: IpAddr,
     ) -> nb::Result<embedded_nal::heapless::String<256>, Self::Error> {
         Err(nb::Error::Other(NalError::UnsupportedAddr))
+    }
+}
+
+#[cfg(test)]
+mod udp_tests {
+    extern crate std;
+
+    use core::cell::RefCell;
+    use std::vec::Vec;
+
+    use drogue_network::tcp::TcpError;
+    use embedded_nal::SocketAddrV4;
+
+    use super::*;
+
+    /// UDP datagrams recorded by destination; TCP is never used.
+    #[derive(Default)]
+    struct Datagrams {
+        sent: RefCell<Vec<([u8; 4], u16)>>,
+    }
+
+    #[derive(Debug)]
+    struct Unused;
+
+    impl From<Unused> for TcpError {
+        fn from(_: Unused) -> Self {
+            TcpError::Impl(drogue_network::tcp::TcpImplError::Unknown)
+        }
+    }
+
+    impl TcpStack for Datagrams {
+        type TcpSocket = ();
+        type Error = Unused;
+        fn open(&self, _: Mode) -> Result<(), Unused> {
+            Err(Unused)
+        }
+        fn connect(&self, _: (), _: HostSocketAddr) -> Result<(), Unused> {
+            Err(Unused)
+        }
+        fn is_connected(&self, _: &()) -> Result<bool, Unused> {
+            Err(Unused)
+        }
+        fn write(&self, _: &mut (), _: &[u8]) -> nb::Result<usize, Unused> {
+            Err(nb::Error::Other(Unused))
+        }
+        fn read(&self, _: &mut (), _: &mut [u8]) -> nb::Result<usize, Unused> {
+            Err(nb::Error::Other(Unused))
+        }
+        fn close(&self, _: ()) -> Result<(), Unused> {
+            Err(Unused)
+        }
+    }
+
+    impl UdpDatagrams for Datagrams {
+        type UdpSocket = u16;
+        type UdpError = Unused;
+        fn udp_open(&self, local_port: u16) -> Result<u16, Unused> {
+            Ok(local_port)
+        }
+        fn udp_send_to(
+            &self,
+            _: &mut u16,
+            remote: [u8; 4],
+            port: u16,
+            _: &[u8],
+        ) -> Result<(), Unused> {
+            self.sent.borrow_mut().push((remote, port));
+            Ok(())
+        }
+        fn udp_recv_from(
+            &self,
+            _: &mut u16,
+            _: &mut [u8],
+        ) -> nb::Result<(usize, [u8; 4], u16), Unused> {
+            Err(nb::Error::WouldBlock)
+        }
+        fn udp_close(&self, _: u16) -> Result<(), Unused> {
+            Ok(())
+        }
+    }
+
+    fn peer(port: u16) -> SocketAddr {
+        SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 94), port))
+    }
+
+    #[test]
+    fn send_goes_to_the_last_send_to_destination() {
+        let mut stack = NalTcpStack::new(Datagrams::default());
+        let mut socket = UdpClientStack::socket(&mut stack).unwrap();
+        UdpClientStack::connect(&mut stack, &mut socket, peer(123)).unwrap();
+        UdpFullStack::send_to(&mut stack, &mut socket, peer(456), b"a").unwrap();
+        UdpClientStack::send(&mut stack, &mut socket, b"b").unwrap();
+
+        // An unconnected socket can `send` once `send_to` has named a peer.
+        let mut unconnected = UdpClientStack::socket(&mut stack).unwrap();
+        UdpFullStack::send_to(&mut stack, &mut unconnected, peer(789), b"a").unwrap();
+        UdpClientStack::send(&mut stack, &mut unconnected, b"b").unwrap();
+
+        let ports: Vec<u16> = stack.inner.sent.borrow().iter().map(|(_, p)| *p).collect();
+        assert_eq!(ports, [456, 456, 789, 789]);
     }
 }
