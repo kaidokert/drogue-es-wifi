@@ -66,6 +66,9 @@ pub enum IpProtocol {
 }
 
 
+/// The longest payload one `S0` write carries.
+pub(crate) const UDP_SEND_MAX: usize = 1046;
+
 pub struct Arbiter<'clock, Spi, ChipSelectPin, ReadyPin, WakeupPin, ResetPin, Clock>
     where
         Spi: Transfer<u8>,
@@ -671,8 +674,8 @@ impl<'clock, Spi, ChipSelectPin, ReadyPin, WakeupPin, ResetPin, Clock> Arbiter<'
         self.process_backlog();
 
         let mut len = buf.len();
-        if len > 1046 {
-            len = 1046
+        if len > UDP_SEND_MAX {
+            len = UDP_SEND_MAX
         }
 
         let mut response = [0u8; 1024];
@@ -735,12 +738,101 @@ impl<'clock, Spi, ChipSelectPin, ReadyPin, WakeupPin, ResetPin, Clock> Arbiter<'
         }
     }
 
+    /// Open `socket_num` as a UDP endpoint on `local_port`.
+    ///
+    /// The module's UDP client mode binds its local port to whatever `P4` holds when
+    /// the socket opens (it ignores `P2`), sends to `P3`/`P4`, which may change while
+    /// the socket stays open, and accepts datagrams from any sender. Server mode
+    /// (`P5`) cannot send before it has received, so it cannot start a request.
+    pub(crate) fn udp_open(&mut self, socket_num: usize, local_port: u16) -> Result<(), ConnectError> {
+        self.process_backlog();
+        let mut response = [0u8; 256];
+        for command in [
+            command!(U16, "P0={}", socket_num),
+            command!(U16, "P6=0"),
+            command!(U16, "P1=1"),
+            command!(U16, "P3=0.0.0.0"),
+            command!(U16, "P4={}", local_port),
+        ] {
+            self.send_string(&command, &mut response)
+                .map_err(ConnectError::SpiError)?;
+        }
+        let response = self
+            .send_string(&command!(U8, "P6=1"), &mut response)
+            .map_err(ConnectError::SpiError)?;
+        if response.windows(2).any(|w| w == b"OK") {
+            Ok(())
+        } else {
+            Err(ConnectError::ConnectionFailed)
+        }
+    }
+
+    /// Send one datagram to `remote`/`port` from an open UDP socket.
+    pub(crate) fn udp_send_to(
+        &mut self,
+        socket_num: usize,
+        remote: [u8; 4],
+        port: u16,
+        buf: &[u8],
+    ) -> Result<usize, WriteError> {
+        // One datagram is one `S0` write. `write` would send the first 1046 bytes
+        // of a longer one, and cannot send an empty one, so both are refused before
+        // anything reaches the module.
+        if buf.is_empty() || buf.len() > UDP_SEND_MAX {
+            return Err(WriteError::Error);
+        }
+        self.process_backlog();
+        let mut response = [0u8; 64];
+        for command in [
+            command!(U32, "P0={}", socket_num),
+            command!(U32, "P3={}.{}.{}.{}", remote[0], remote[1], remote[2], remote[3]),
+            command!(U32, "P4={}", port),
+        ] {
+            self.send_string(&command, &mut response)
+                .map_err(WriteError::SpiError)?;
+        }
+        self.write(socket_num, buf)
+    }
+
+    /// Receive at most one datagram, and its sender.
+    ///
+    /// One `R0` returns one datagram, truncated to the requested length with the
+    /// rest discarded. Asking for one byte more than `buffer` holds is what makes a
+    /// datagram that did not fit visible: the returned length then exceeds
+    /// `buffer.len()`, and only `buffer.len()` bytes were kept. A datagram longer
+    /// than the module's own 1460-byte read limit is truncated undetectably.
+    ///
+    /// `P?` then reports the sender of the datagram just read: its address in the
+    /// second field and its port in the fifth. `Ok(None)` when nothing is waiting.
+    pub(crate) fn udp_recv_from(
+        &mut self,
+        socket_num: usize,
+        buffer: &mut [u8],
+    ) -> Result<Option<(usize, [u8; 4], u16)>, ReadError> {
+        let limit = buffer.len().saturating_add(1);
+        let len = self.read_internal(socket_num, buffer, limit)?;
+        // The module answers `R0` for a zero-length datagram exactly as it does
+        // when nothing is waiting, so such a datagram is indistinguishable from
+        // no data and reads as none.
+        if len == 0 {
+            return Ok(None);
+        }
+        let mut response = [0u8; 160];
+        let response = self
+            .send_string(&command!(U8, "P?"), &mut response)
+            .map_err(ReadError::SpiError)?;
+        let (ip, port) = parser::udp_sender(response).ok_or(ReadError::Error)?;
+        Ok(Some((len, ip, port)))
+    }
+
     pub(crate) fn read(&mut self, socket_num: usize, buffer: &mut [u8]) -> Result<usize, ReadError> {
         self.process_backlog();
         let mut pos = 0;
         let buf_len = buffer.len();
         loop {
-            let result = self.read_internal(socket_num, &mut buffer[pos..buf_len]);
+            let rest = &mut buffer[pos..buf_len];
+            let limit = rest.len();
+            let result = self.read_internal(socket_num, rest, limit);
             match result {
                 Ok(len) => {
                     pos += len;
@@ -759,7 +851,10 @@ impl<'clock, Spi, ChipSelectPin, ReadyPin, WakeupPin, ResetPin, Clock> Arbiter<'
         }
     }
 
-    fn read_internal(&mut self, socket_num: usize, buffer: &mut [u8]) -> Result<usize, ReadError> {
+    /// One `R0`, asking the module for at most `limit` bytes. Copies what fits into
+    /// `buffer` and returns how many bytes the module delivered, which exceeds
+    /// `buffer.len()` only when the caller asked for more than it can hold.
+    fn read_internal(&mut self, socket_num: usize, buffer: &mut [u8], limit: usize) -> Result<usize, ReadError> {
         self.process_backlog();
 
         // Must hold a full R1-capped read (1460) plus the `\r\n..\r\nOK\r\n> ` framing;
@@ -771,10 +866,7 @@ impl<'clock, Spi, ChipSelectPin, ReadyPin, WakeupPin, ResetPin, Clock> Arbiter<'
             &mut response,
         ).map_err(|e| ReadError::SpiError(e))?;
 
-        let mut len = buffer.len();
-        if len > 1460 {
-            len = 1460;
-        }
+        let len = limit.min(1460);
 
         self.send_string(
             &command!( U16, "R1={}", len),
@@ -810,9 +902,8 @@ impl<'clock, Spi, ChipSelectPin, ReadyPin, WakeupPin, ResetPin, Clock> Arbiter<'
         let response = self.receive_raw(&mut response).map_err(|e| ReadError::SpiError(e))?;
 
         if let Ok((_, ReadResponse::Ok(data))) = parser::read_response(&response) {
-            for (i, b) in data.iter().enumerate() {
-                buffer[i] = *b;
-            }
+            let copied = data.len().min(buffer.len());
+            buffer[..copied].copy_from_slice(&data[..copied]);
             return Ok(data.len());
         }
         //result

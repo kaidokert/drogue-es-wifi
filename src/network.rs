@@ -137,3 +137,79 @@ impl<'clock, Spi, ChipSelectPin, ReadyPin, WakeupPin, ResetPin, Clock> TcpStack 
         Ok(())
     }
 }
+
+/// A UDP endpoint on one of the module's sockets.
+#[derive(Debug)]
+pub struct UdpSocket(usize);
+
+#[derive(Debug)]
+pub enum UdpError {
+    NoAvailableSockets,
+    OpenFailed,
+    WriteError,
+    ReadError,
+    /// The datagram was longer than the receive buffer. It has been consumed; the
+    /// buffer holds its first `buffer.len()` bytes.
+    Oversize,
+}
+
+impl<'clock, Spi, ChipSelectPin, ReadyPin, WakeupPin, ResetPin, Clock> crate::nal::UdpDatagrams for Adapter<'clock, Spi, ChipSelectPin, ReadyPin, WakeupPin, ResetPin, Clock>
+    where
+        Spi: Transfer<u8>,
+        ChipSelectPin: OutputPin,
+        ReadyPin: InputPin,
+        WakeupPin: OutputPin,
+        ResetPin: OutputPin,
+        Clock: embedded_time::Clock + 'clock
+{
+    type UdpSocket = UdpSocket;
+    type UdpError = UdpError;
+
+    fn udp_open(&self, local_port: u16) -> Result<UdpSocket, UdpError> {
+        let index = {
+            let mut sockets = self.sockets.borrow_mut();
+            let (index, socket) = sockets
+                .iter_mut()
+                .enumerate()
+                .find(|(_, e)| e.is_closed())
+                .ok_or(UdpError::NoAvailableSockets)?;
+            socket.state = State::Open;
+            index
+        };
+        if self.arbiter.borrow_mut().udp_open(index, local_port).is_err() {
+            self.sockets.borrow_mut()[index].state = State::Closed;
+            return Err(UdpError::OpenFailed);
+        }
+        Ok(UdpSocket(index))
+    }
+
+    fn udp_send_to(&self, socket: &mut UdpSocket, remote: [u8; 4], port: u16, buffer: &[u8]) -> Result<(), UdpError> {
+        if !self.sockets.borrow()[socket.0].is_open() {
+            return Err(UdpError::WriteError);
+        }
+        match self.arbiter.borrow_mut().udp_send_to(socket.0, remote, port, buffer) {
+            Ok(sent) if sent == buffer.len() => Ok(()),
+            _ => Err(UdpError::WriteError),
+        }
+    }
+
+    fn udp_recv_from(&self, socket: &mut UdpSocket, buffer: &mut [u8]) -> nb::Result<(usize, [u8; 4], u16), UdpError> {
+        if !self.sockets.borrow()[socket.0].is_open() {
+            return Err(nb::Error::Other(UdpError::ReadError));
+        }
+        match self.arbiter.borrow_mut().udp_recv_from(socket.0, buffer) {
+            Ok(Some((len, _, _))) if len > buffer.len() => Err(nb::Error::Other(UdpError::Oversize)),
+            Ok(Some(datagram)) => Ok(datagram),
+            Ok(None) => Err(nb::Error::WouldBlock),
+            Err(_) => Err(nb::Error::Other(UdpError::ReadError)),
+        }
+    }
+
+    fn udp_close(&self, socket: UdpSocket) -> Result<(), UdpError> {
+        // The slot is freed only once the module has closed the socket, so a
+        // failed close cannot hand a still-open module socket to the next open.
+        self.arbiter.borrow_mut().close(socket.0).map_err(|_| UdpError::ReadError)?;
+        self.sockets.borrow_mut()[socket.0].state = State::Closed;
+        Ok(())
+    }
+}
