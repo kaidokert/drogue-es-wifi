@@ -66,6 +66,9 @@ pub enum IpProtocol {
 }
 
 
+/// The longest payload one `S0` write carries.
+pub(crate) const UDP_SEND_MAX: usize = 1046;
+
 pub struct Arbiter<'clock, Spi, ChipSelectPin, ReadyPin, WakeupPin, ResetPin, Clock>
     where
         Spi: Transfer<u8>,
@@ -671,8 +674,8 @@ impl<'clock, Spi, ChipSelectPin, ReadyPin, WakeupPin, ResetPin, Clock> Arbiter<'
         self.process_backlog();
 
         let mut len = buf.len();
-        if len > 1046 {
-            len = 1046
+        if len > UDP_SEND_MAX {
+            len = UDP_SEND_MAX
         }
 
         let mut response = [0u8; 1024];
@@ -772,6 +775,12 @@ impl<'clock, Spi, ChipSelectPin, ReadyPin, WakeupPin, ResetPin, Clock> Arbiter<'
         port: u16,
         buf: &[u8],
     ) -> Result<usize, WriteError> {
+        // One datagram is one `S0` write. `write` would send the first 1046 bytes
+        // of a longer one, and cannot send an empty one, so both are refused before
+        // anything reaches the module.
+        if buf.is_empty() || buf.len() > UDP_SEND_MAX {
+            return Err(WriteError::Error);
+        }
         self.process_backlog();
         let mut response = [0u8; 64];
         for command in [
@@ -802,6 +811,9 @@ impl<'clock, Spi, ChipSelectPin, ReadyPin, WakeupPin, ResetPin, Clock> Arbiter<'
     ) -> Result<Option<(usize, [u8; 4], u16)>, ReadError> {
         let limit = buffer.len().saturating_add(1);
         let len = self.read_internal(socket_num, buffer, limit)?;
+        // The module answers `R0` for a zero-length datagram exactly as it does
+        // when nothing is waiting, so such a datagram is indistinguishable from
+        // no data and reads as none.
         if len == 0 {
             return Ok(None);
         }

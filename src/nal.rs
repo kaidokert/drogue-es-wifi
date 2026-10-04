@@ -391,6 +391,19 @@ where
         port
     }
 
+    /// Open an unopened socket on the next ephemeral port. An open socket keeps
+    /// its port, and takes none from the range.
+    fn open_ephemeral(
+        &mut self,
+        socket: &mut NalUdpSocket<T::UdpSocket>,
+    ) -> Result<(), NalError<T::UdpError>> {
+        if socket.inner.is_some() {
+            return Ok(());
+        }
+        let port = self.ephemeral_port();
+        self.open_udp(socket, port)
+    }
+
     fn open_udp(
         &mut self,
         socket: &mut NalUdpSocket<T::UdpSocket>,
@@ -420,8 +433,7 @@ where
 
     fn connect(&mut self, socket: &mut Self::UdpSocket, remote: SocketAddr) -> Result<(), Self::Error> {
         let remote = ipv4(remote)?;
-        let port = self.ephemeral_port();
-        self.open_udp(socket, port)?;
+        self.open_ephemeral(socket)?;
         socket.remote = Some(remote);
         Ok(())
     }
@@ -474,8 +486,7 @@ where
         buffer: &[u8],
     ) -> nb::Result<(), Self::Error> {
         let (ip, port) = ipv4(remote).map_err(nb::Error::Other)?;
-        let local = self.ephemeral_port();
-        self.open_udp(socket, local).map_err(nb::Error::Other)?;
+        self.open_ephemeral(socket).map_err(nb::Error::Other)?;
         let inner = socket.inner.as_mut().ok_or(nb::Error::Other(NalError::NotConnected))?;
         self.inner
             .udp_send_to(inner, ip, port, buffer)

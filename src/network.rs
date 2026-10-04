@@ -206,7 +206,10 @@ impl<'clock, Spi, ChipSelectPin, ReadyPin, WakeupPin, ResetPin, Clock> crate::na
     }
 
     fn udp_close(&self, socket: UdpSocket) -> Result<(), UdpError> {
+        // The slot is freed only once the module has closed the socket, so a
+        // failed close cannot hand a still-open module socket to the next open.
+        self.arbiter.borrow_mut().close(socket.0).map_err(|_| UdpError::ReadError)?;
         self.sockets.borrow_mut()[socket.0].state = State::Closed;
-        self.arbiter.borrow_mut().close(socket.0).map_err(|_| UdpError::ReadError)
+        Ok(())
     }
 }
