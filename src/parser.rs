@@ -255,19 +255,22 @@ pub(crate) enum ReadResponse<'a> {
     Err,
 }
 
-named!(
-    pub(crate) read_data<ReadResponse>,
-    do_parse!(
-        tag!("\r\n") >>
-        data: take_until!("\r\nOK\r\n>") >>
-        tag!("\r\n") >>
-        ok >>
-        prompt >>
-        (
-            ReadResponse::Ok(data)
-        )
-    )
-);
+// The SPI DATA_READY boundary has already delimited the complete response.
+// Prompt-looking bytes inside the socket payload are data, not AT framing.
+pub(crate) fn read_data(input: &[u8]) -> nom::IResult<&[u8], ReadResponse<'_>> {
+    let end = input
+        .iter()
+        .rposition(|&byte| byte != 0x15)
+        .map_or(0, |i| i + 1);
+    let framed = &input[..end];
+    let payload = framed
+        .strip_prefix(b"\r\n")
+        .and_then(|body| body.strip_suffix(b"\r\nOK\r\n> "));
+    match payload {
+        Some(data) => Ok((&input[end..], ReadResponse::Ok(data))),
+        None => Err(nom::Err::Error((input, nom::error::ErrorKind::Tag))),
+    }
+}
 
 named!(
     pub(crate) read_error<ReadResponse>,
@@ -341,6 +344,40 @@ mod udp_sender_tests {
         match read_response(b"\r\nabc\r\nOK\r\n> ") {
             Ok((_, ReadResponse::Ok(data))) => assert_eq!(data, b"abc"),
             _ => panic!("data read did not parse"),
+        }
+    }
+
+    #[test]
+    fn binary_payload_may_contain_module_prompts() {
+        let payload = b"\0ERROR\r\n> \r\nOK\r\n>\0\r\nOK\r\n> \x15tail\x15";
+        let mut reply = [0; 128];
+        reply[..2].copy_from_slice(b"\r\n");
+        reply[2..2 + payload.len()].copy_from_slice(payload);
+        let trailer = b"\r\nOK\r\n> \x15";
+        let end = 2 + payload.len() + trailer.len();
+        reply[2 + payload.len()..end].copy_from_slice(trailer);
+        match read_response(&reply[..end]) {
+            Ok((_, ReadResponse::Ok(data))) => assert_eq!(data, payload),
+            other => panic!("binary read failed: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn an_embedded_complete_prompt_does_not_truncate_data() {
+        let reply = b"\r\none\r\nOK\r\n> two\r\nOK\r\n> ";
+        match read_response(reply) {
+            Ok((rest, ReadResponse::Ok(data))) => {
+                assert!(rest.is_empty());
+                assert_eq!(data, b"one\r\nOK\r\n> two");
+            }
+            other => panic!("binary read failed: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn a_read_requires_a_complete_terminal_prompt() {
+        for reply in [&b"\r\ndata\r\nOK\r\n>"[..], b"\r\ndata\r\nOK\r\n> junk"] {
+            assert!(read_response(reply).is_err());
         }
     }
 
