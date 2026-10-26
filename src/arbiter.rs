@@ -26,10 +26,13 @@ macro_rules! command {
     })
 }
 
-/// Upper bound on any single wait for the module to assert DATA_READY. Generous enough
+/// Default bound for the module to assert DATA_READY. Generous enough
 /// not to trip on a legitimately slow op (an over-the-air DNS lookup or connect), while
 /// still bounding a stuck module to a finite error instead of an unbounded spin.
 const READY_TIMEOUT_MS: u32 = 5_000;
+
+// Association responses can legitimately take more than five seconds on the L475.
+const JOIN_RESPONSE_TIMEOUT_MS: u32 = 10_000;
 
 /// RESET-low hold for a mid-run recovery, longer than the 50 ms cold-boot pulse.
 /// Live experiments found a running module ignores a <=120 ms pulse but a ~1 s
@@ -373,6 +376,10 @@ impl<'clock, Spi, ChipSelectPin, ReadyPin, WakeupPin, ResetPin, Clock> Arbiter<'
     /// forever, invisibly to an external watchdog.
     /// Bounding it converts that silent hang into a countable, recoverable error.
     fn await_data_ready(&mut self) -> Result<(), SpiError> {
+        self.await_data_ready_for(READY_TIMEOUT_MS)
+    }
+
+    fn await_data_ready_for(&mut self, timeout_ms: u32) -> Result<(), SpiError> {
         // Injected fault: report the same countable timeout the real path does, but
         // without the wait, so a test does not pay READY_TIMEOUT_MS per operation.
         #[cfg(feature = "fault-injection")]
@@ -382,7 +389,7 @@ impl<'clock, Spi, ChipSelectPin, ReadyPin, WakeupPin, ResetPin, Clock> Arbiter<'
         }
         let timer = self
             .clock
-            .new_timer(Milliseconds(READY_TIMEOUT_MS))
+            .new_timer(Milliseconds(timeout_ms))
             .start()
             .map_err(|_| SpiError::ReadError)?;
         while !self.ready.is_ready() {
@@ -399,6 +406,10 @@ impl<'clock, Spi, ChipSelectPin, ReadyPin, WakeupPin, ResetPin, Clock> Arbiter<'
     }
 
     fn send<'a>(&mut self, command: &[u8], response: &'a mut [u8]) -> Result<&'a [u8], SpiError> {
+        self.send_with_response_timeout(command, response, READY_TIMEOUT_MS)
+    }
+
+    fn send_with_response_timeout<'a>(&mut self, command: &[u8], response: &'a mut [u8], timeout_ms: u32) -> Result<&'a [u8], SpiError> {
         //log::info!("send {:?}", core::str::from_utf8(command).unwrap());
 
         self.await_data_ready()?;
@@ -420,11 +431,15 @@ impl<'clock, Spi, ChipSelectPin, ReadyPin, WakeupPin, ResetPin, Clock> Arbiter<'
                 }
             }
         }
-        self.receive(response)
+        self.receive_with_timeout(response, timeout_ms)
     }
 
     fn receive<'a>(&mut self, response: &'a mut [u8]) -> Result<&'a [u8], SpiError> {
-        self.await_data_ready()?;
+        self.receive_with_timeout(response, READY_TIMEOUT_MS)
+    }
+
+    fn receive_with_timeout<'a>(&mut self, response: &'a mut [u8], timeout_ms: u32) -> Result<&'a [u8], SpiError> {
+        self.await_data_ready_for(timeout_ms)?;
         let mut pos = 0;
 
         let _cs = self.cs.select();
@@ -533,7 +548,7 @@ impl<'clock, Spi, ChipSelectPin, ReadyPin, WakeupPin, ResetPin, Clock> Arbiter<'
                     &command!(U8, "C4=1"),
                     &mut response).map_err(|_| JoinError::Unknown)?;
 
-                let response = self.send_string(&command!(U4, "C0"), &mut response).map_err(|_| JoinError::Unknown)?;
+                let response = self.send_with_response_timeout(b"C0\r", &mut response, JOIN_RESPONSE_TIMEOUT_MS).map_err(|_| JoinError::Unknown)?;
 
                 // Capture the DHCP IP (owned) before `response` is borrowed by the parser.
                 let ip = parse_join_ip(response);
@@ -911,3 +926,5 @@ impl<'clock, Spi, ChipSelectPin, ReadyPin, WakeupPin, ResetPin, Clock> Arbiter<'
     }
 }
 
+#[cfg(test)]
+mod tests;
