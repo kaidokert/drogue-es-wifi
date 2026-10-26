@@ -63,6 +63,14 @@ let mut spi = Spi::spi3(
 ### Clock
 
 An `embedded-time` `Clock` is required in order to provide appropriate delays and timeouts.
+CS assertion and deassertion each request a 500 µs guard. Use a clock with
+sub-millisecond resolution; timer quantization and scheduling affect the actual
+delay. The L475 qualification uses a 200 µs clock tick.
+
+The Wi-Fi join command allows up to 10 seconds for its response to become ready.
+Other READY waits and response drains remain bounded at 5 seconds. Association
+responses exceeding 5 seconds were observed on the L475 even with 1 ms CS guards.
+
 The [drogue-embedded-timer](https://crates.io/crates/drogue-embedded-timer) crate provides utilities and instructions for managing clocks.
 
 ### Initialization

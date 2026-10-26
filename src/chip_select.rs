@@ -1,6 +1,6 @@
 use embedded_hal::digital::v2::OutputPin;
 use drogue_embedded_timer::Delay;
-use embedded_time::duration::Milliseconds;
+use embedded_time::duration::Microseconds;
 
 pub(crate) struct ChipSelect<'clock, Pin, Clock>
     where Pin: OutputPin,
@@ -49,7 +49,7 @@ impl<'pin, 'clock, Pin, Clock> Selected<'pin, 'clock, Pin, Clock>
 {
     fn new(cs: &'pin mut ChipSelect<'clock, Pin, Clock>) -> Self {
         cs.set_low();
-        cs.delay.delay( Milliseconds(10u32));
+        cs.delay.delay( Microseconds(500u32));
         Self {
             cs
         }
@@ -62,6 +62,6 @@ impl<Pin, Clock> Drop for Selected<'_, '_, Pin, Clock>
 {
     fn drop(&mut self) {
         self.cs.set_high();
-        self.cs.delay.delay( Milliseconds(10u32));
+        self.cs.delay.delay( Microseconds(500u32));
     }
 }
